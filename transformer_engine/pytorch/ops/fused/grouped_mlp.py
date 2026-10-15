@@ -3288,18 +3288,29 @@ def fuse_unary_activation_ops(
 #     FC1 dgrad            grouped_gemm_wrapper_sm100        GroupedGemmBf16API
 #     FC1/FC2 wgrad        grouped_gemm_wgrad_wrapper_sm100  GroupedGemmWgradBf16API
 #
-# Three contract differences from the block-scaled path produce wrong numbers
-# rather than an exception if missed:
+# Every operand is passed in cuDNN's canonical layout -- A (M, K), C/D (M, N),
+# prob/dprob (M,), packed B (experts, N, K) -- which the BF16 wrappers accept
+# from cuDNN frontend PR #1602 on (``supports_bf16_canonical_layouts``). The
+# same PR made ``padded_offsets`` / ``b_ptrs`` / ``wgrad_ptrs`` a device-data
+# contract: warm ``execute()`` calls never copy them to the host, so nothing on
+# this path synchronizes the stream.
+#
+# Four contract differences from the block-scaled path:
 #
 # 1. ``generate_c=True`` must be passed to the GLU wrapper. The block-scaled
 #    kernel always writes the pre-activation ``C``; the BF16 wrapper returns
 #    ``c_tensor=None`` unless asked, leaving the backward no activation input.
-# 2. ``prob_tensor`` is mandatory, ``float32``, shape ``(total_tokens, 1, 1)``.
-#    The block-scaled path passes ``None`` or the compute dtype; BF16 rejects both.
+# 2. ``prob_tensor`` is mandatory and ``float32``. The block-scaled path passes
+#    ``None`` or the compute dtype; BF16 rejects both.
 # 3. ``geglu_alpha`` / ``glu_clamp_max`` / ``glu_clamp_min`` must never be
 #    forwarded. The BF16 GLU backend raises on any non-default value; its clamp
 #    is hardwired to +/-7.0 and its GeGLU alpha to 1.702, so
 #    ``_bf16_glu_act_funcs`` declines activations asking for anything else.
+# 4. ``dprob`` is reduced across N tiles with fp32 atomics, so it is not bit-exact
+#    run to run, and the BF16 dGLU backend rejects ``deterministic=True``. A
+#    determinism request is refused (see ``fuser_backward``).
+#
+# Items 1-3 produce wrong numbers rather than an exception if missed.
 
 # The BF16 GLU/dGLU kernels hardwire these; an activation asking for anything
 # else cannot be served and is declined at fusion time.
@@ -3314,6 +3325,12 @@ _BF16_M_ALIGNMENT: int = 256
 # the kernel bakes in. Matches the comparison already used for the block-scaled
 # GeGLU guard in grouped_mlp.fuse_grouped_mlp_ops.
 _BF16_FLOAT_MATCH_TOL: float = 1e-3
+
+# First cuDNN frontend release with canonical layouts and device-only offsets for the
+# BF16 grouped GEMM backends (PR #1602). develop reported 1.32.0 before that PR merged,
+# so a source build can satisfy the version and still lack the contract; the
+# ``supports_bf16_canonical_layouts`` flag checked in ``is_supported`` covers that case.
+_BF16_MIN_CUDNN_FRONTEND_VERSION: str = "1.32.0"
 
 
 def _cudnn_bf16_dgeglu_supported() -> bool:
@@ -3357,23 +3374,18 @@ def _bf16_glu_act_funcs(activation_op) -> Optional[tuple[str, str, float]]:
     return None
 
 
-def _bf16_as_cudnn_3d(tensor: torch.Tensor, rows: int, cols: int) -> torch.Tensor:
-    """View a contiguous ``(rows, cols)`` tensor as cuDNN's ``(rows, cols, 1)``.
-
-    The CuTe DSL APIs require exactly stride ``(cols, 1, rows * cols)``; the
-    trailing unit dimension is the expert/batch mode the grouped kernels index
-    with a zero stride at runtime.
-    """
-    return tensor.view(rows, cols).unsqueeze(0).permute(1, 2, 0)
-
-
 def _bf16_ones_prob(total_tokens: int, device: torch.device) -> torch.Tensor:
-    """Unit ``prob`` operand of the shape and dtype the BF16 APIs require.
+    """Unit ``prob`` operand: canonical ``(total_tokens,)`` float32 ones.
 
     Backed by the shared ones cache so the data pointer is stable across CUDA
     graph replays.
     """
-    return get_cached_ones_tensor(total_tokens, torch.float32, device).reshape(total_tokens, 1, 1)
+    return get_cached_ones_tensor(total_tokens, torch.float32, device)
+
+
+@functools.lru_cache(maxsize=None)
+def _bf16_weight_names(num_groups: int) -> tuple[str, ...]:
+    return tuple(f"weight{idx}" for idx in range(num_groups))
 
 
 def _bf16_per_expert_weights(fc_op: GroupedLinear, num_groups: int) -> list[torch.Tensor]:
@@ -3382,12 +3394,14 @@ def _bf16_per_expert_weights(fc_op: GroupedLinear, num_groups: int) -> list[torc
     Both parameter layouts are flattened to the same list so the pointer-array
     (discrete) call path is identical for packed and per-expert parameters. For
     ``single_grouped_weight=True`` these are views into the one packed buffer,
-    not copies.
+    not copies. Per-expert parameters are read from ``_parameters`` directly:
+    ``nn.Module.__getattr__`` costs about a microsecond per lookup on this hot path.
     """
     if fc_op.single_grouped_weight:
         packed = _bf16_packed_weight(fc_op, num_groups)
         return [packed[idx] for idx in range(num_groups)]
-    return [getattr(fc_op, f"weight{idx}") for idx in range(num_groups)]
+    params = fc_op._parameters
+    return [params[name] for name in _bf16_weight_names(num_groups)]
 
 
 def _bf16_packed_weight(fc_op: GroupedLinear, num_groups: int) -> torch.Tensor:
@@ -3404,6 +3418,32 @@ def _bf16_packed_weight(fc_op: GroupedLinear, num_groups: int) -> torch.Tensor:
     return data.view(num_groups, fc_op.out_features, fc_op.in_features)
 
 
+def _bf16_weight_ptrs(fc_op: GroupedLinear, num_groups: int, device: torch.device) -> torch.Tensor:
+    """Device table of per-expert weight data pointers, reused while they are unchanged.
+
+    The table's contents are exactly its cache key, so a hit is always correct; it is
+    rebuilt only when a weight is reallocated. Reuse replaces a per-call
+    ``copy_data_ptrs_to_device`` upload, and keeps the table's address stable across
+    CUDA graph replays. The same table serves both orientations: forward GEMMs read
+    the ``(out, in)`` weights K-major, dgrad GEMMs read them N-major.
+    """
+    if fc_op.single_grouped_weight:
+        packed = _bf16_packed_weight(fc_op, num_groups)
+        key = (device, packed.data_ptr(), packed.shape)
+        weights = None
+    else:
+        weights = _bf16_per_expert_weights(fc_op, num_groups)
+        key = (device, tuple(w.data_ptr() for w in weights))
+    cached = fc_op.__dict__.get("_bf16_weight_ptrs_cache")
+    if cached is not None and cached[0] == key:
+        return cached[1]
+    if weights is None:
+        weights = [packed[idx] for idx in range(num_groups)]
+    ptrs = tex.copy_data_ptrs_to_device(weights, device)
+    fc_op.__dict__["_bf16_weight_ptrs_cache"] = (key, ptrs)
+    return ptrs
+
+
 def _bf16_fprop_weight_kwargs(
     fc_op: GroupedLinear,
     num_groups: int,
@@ -3411,62 +3451,40 @@ def _bf16_fprop_weight_kwargs(
 ) -> dict[str, Any]:
     """Wrapper kwargs for a forward-orientation (K-major) B operand.
 
-    A forward GEMM contracts over ``in_features``, so B is ``(out, in, experts)``
-    with stride ``(in, 1, out * in)`` -- exactly how TE stores expert-major
-    weights, which is why the packed case needs only a permute and no copy.
+    A forward GEMM contracts over ``in_features``. A packed weight is passed as
+    cuDNN's canonical ``(experts, out, in)`` row-major B -- exactly how TE stores
+    it, so no view is needed. Per-expert weights go through the pointer table.
     """
     if fc_op.single_grouped_weight:
-        return {"b_tensor": _bf16_packed_weight(fc_op, num_groups).permute(1, 2, 0)}
-    weights = _bf16_per_expert_weights(fc_op, num_groups)
+        return {"b_tensor": _bf16_packed_weight(fc_op, num_groups)}
     return {
-        "b_ptrs": tex.copy_data_ptrs_to_device(weights, device),
+        "b_ptrs": _bf16_weight_ptrs(fc_op, num_groups, device),
         "n": fc_op.out_features,
         "b_dtype": torch.bfloat16,
         "b_major": "k",
     }
 
 
-def _bf16_dglu_weight_kwargs(
+def _bf16_dgrad_weight_kwargs(
     fc_op: GroupedLinear,
     num_groups: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    """Wrapper kwargs for the dGLU kernel's dgrad-orientation (MN-major) B operand.
+    """Wrapper kwargs for a dgrad-orientation (MN-major) B operand.
 
-    A dgrad GEMM contracts over ``out_features``, so a K-major B would be
-    ``(in, out, experts)`` -- a per-expert transpose of how TE stores weights.
-    The block-scaled path gets that for free from the columnwise quantized copy.
-    The BF16 dGLU backend instead accepts ``b_major="n"`` in discrete
-    pointer-array mode, which declares the existing ``(out, in)`` buffers as
-    MN-major with no copy. That works for packed weights too, since the
-    per-expert views point into the packed buffer.
-
-    Only valid for dGLU: the plain BF16 grouped GEMM is K-major only; see
-    ``_bf16_transposed_weight_kwargs``.
+    A dgrad GEMM contracts over ``out_features``, so a K-major B would be the
+    per-expert transpose of how TE stores weights. Both BF16 dgrad kernels -- the
+    dGLU (FC2 dgrad) and the plain grouped GEMM (FC1 dgrad) -- accept
+    ``b_major="n"`` in discrete pointer-array mode, which declares the existing
+    ``(out, in)`` buffers MN-major with no copy. Packed weights use the same table
+    of per-expert views.
     """
-    weights = _bf16_per_expert_weights(fc_op, num_groups)
     return {
-        "b_ptrs": tex.copy_data_ptrs_to_device(weights, device),
+        "b_ptrs": _bf16_weight_ptrs(fc_op, num_groups, device),
         "n": fc_op.in_features,
         "b_dtype": torch.bfloat16,
         "b_major": "n",
     }
-
-
-def _bf16_transposed_weight_kwargs(fc_op: GroupedLinear, num_groups: int) -> dict[str, Any]:
-    """Wrapper kwargs for the plain BF16 grouped GEMM's dgrad B operand (FC1 dgrad).
-
-    Unlike dGLU, the plain BF16 grouped GEMM accepts only K-major B (cuDNN
-    frontend 1.30 rejects ``b_major="n"`` for its BF16 backend), so the
-    per-expert transpose is materialized: one read and write of the weight per
-    backward, small next to the GEMMs. The result is a dense
-    ``(in, out, experts)`` operand with stride ``(out, 1, in * out)``.
-    """
-    if fc_op.single_grouped_weight:
-        weight_t = _bf16_packed_weight(fc_op, num_groups).transpose(1, 2).contiguous()
-    else:
-        weight_t = torch.stack([w.t() for w in _bf16_per_expert_weights(fc_op, num_groups)])
-    return {"b_tensor": weight_t.permute(1, 2, 0)}
 
 
 def _bf16_wgrad_fn_factory(
@@ -3498,6 +3516,27 @@ def _bf16_wgrad_fn_factory(
         )
 
     return factory
+
+
+def _bf16_packed_wgrad_buffer(
+    wgrad_output: list[torch.Tensor], num_groups: int, weight_shape: tuple[int, int]
+) -> Optional[torch.Tensor]:
+    """The contiguous ``(num_groups, out, in)`` buffer behind a per-expert wgrad list, if any.
+
+    Without main_grad fusion, ``_compute_grad_params`` builds the list as
+    ``[packed[i] for i in range(num_groups)]`` over one buffer; writing that buffer in
+    dense mode needs no device pointer table. Main_grad buffers (separate parameters)
+    fall back to discrete pointers.
+    """
+    base = wgrad_output[0]._base
+    if base is None or base.shape != (num_groups, *weight_shape) or not base.is_contiguous():
+        return None
+    base_ptr = base.data_ptr()
+    stride_bytes = weight_shape[0] * weight_shape[1] * base.element_size()
+    for idx, w in enumerate(wgrad_output):
+        if w._base is not base or w.data_ptr() != base_ptr + idx * stride_bytes:
+            return None
+    return base
 
 
 def _bf16_cudnn_wgrad(
@@ -3551,6 +3590,9 @@ def _bf16_cudnn_wgrad(
 
     if single_grouped_weight:
         wgrad_tensor = wgrad_output.rowwise_data.view(num_groups, out_features, in_features)
+    else:
+        wgrad_tensor = _bf16_packed_wgrad_buffer(wgrad_output, num_groups, weight_shape)
+    if wgrad_tensor is not None:
         wgrad_kernel_fn(
             **common_kwargs,
             output_mode="dense",
@@ -3673,16 +3715,31 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
             return False
         if get_device_compute_capability()[0] != 10:
             return False
-        if not _cudnn_frontend_version_supported():
+        # The op passes canonical operands (2-D A/C/D, 1-D prob, (experts, n, k) B)
+        # straight through and reads dgrad weights N-major. A cuDNN frontend from
+        # before PR #1602 would reject those layouts, and would also copy offsets to
+        # the host on every call, so decline and let the unfused ops run.
+        if not _cudnn_frontend_version_at_least(_BF16_MIN_CUDNN_FRONTEND_VERSION):
             return False
         try:
-            cls.grouped_gemm_kernel()
-            cls.grouped_gemm_activation_kernel()
-            cls.grouped_gemm_dactivation_kernel()
-            cls.grouped_gemm_wgrad_kernel()
+            kernels = (
+                cls.grouped_gemm_kernel(),
+                cls.grouped_gemm_activation_kernel(),
+                cls.grouped_gemm_dactivation_kernel(),
+                cls.grouped_gemm_wgrad_kernel(),
+            )
         except ImportError:
             return False
-        return True
+        return all(getattr(k, "supports_bf16_canonical_layouts", False) for k in kernels)
+
+    @classmethod
+    def grouped_gemm_dactivation_is_deterministic(cls) -> bool:
+        """Whether this op's dactivation kernel can produce a bit-exact ``dprob``.
+
+        Never: the BF16 dGLU sums ``dprob`` with fp32 atomics and its wrapper raises
+        ``NotImplementedError`` for ``deterministic=True``.
+        """
+        return False
 
     def __init__(
         self,
@@ -3803,8 +3860,9 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
             bulk_allocate=True,
         )
 
-        # Per-token routing probability. The BF16 APIs require float32 (M, 1, 1);
-        # the block-scaled path passes the compute dtype, which would be rejected.
+        # Per-token routing probability: the BF16 APIs take float32, here in cuDNN's
+        # canonical (M,) form. It is computed once and saved for the backward dGLU,
+        # which needs the same operand.
         scales = basic_op_extra_inputs[1][0]
         unit_activation_scale = bool(
             getattr(activation_op, "_grouped_mlp_unit_activation_scale", False)
@@ -3812,38 +3870,38 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
         if unit_activation_scale and num_groups != 1:
             unit_activation_scale = False
         if unit_activation_scale:
-            fc1_prob_tensor = _bf16_ones_prob(total_tokens, device)
+            prob_tensor = _bf16_ones_prob(total_tokens, device)
         else:
-            fc1_prob_tensor = scales.detach().to(dtype=torch.float32).reshape(total_tokens, 1, 1)
+            prob_tensor = scales.detach().reshape(total_tokens).to(dtype=torch.float32)
 
         alpha_tensor = get_cached_ones_tensor(num_groups, torch.float32, device)
         current_stream = torch.cuda.current_stream(device.index).cuda_stream
         fc1_x = maybe_dequantize(input_, dtype).contiguous()
 
-        # FC1 GEMM + GLU activation.
-        fc1_activation_kwargs = {
-            "a_tensor": _bf16_as_cudnn_3d(fc1_x, total_tokens, fc1_weight_shape[1]),
-            "sfa_tensor": None,
-            "padded_offsets": split_points,
-            "alpha_tensor": alpha_tensor,
-            "bias_tensor": _pack_grouped_linear_bias_for_cudnn(fc1_op),
-            "prob_tensor": fc1_prob_tensor,
-            "acc_dtype": torch.float32,
-            "c_dtype": dtype,
-            "d_dtype": dtype,
-            "cd_major": "n",
-            "act_func": self._cudnn_act_func,
-            "linear_offset": self._cudnn_linear_offset,
+        # FC1 GEMM + GLU activation. Every activation operand is in cuDNN's canonical
+        # layout -- A (M, K), C/D (M, N), prob (M,) -- so no views are built here.
+        fc1_kernel_out = self.grouped_gemm_activation_kernel()(
+            a_tensor=fc1_x,
+            sfa_tensor=None,
+            padded_offsets=split_points,
+            alpha_tensor=alpha_tensor,
+            bias_tensor=_pack_grouped_linear_bias_for_cudnn(fc1_op),
+            prob_tensor=prob_tensor,
+            acc_dtype=torch.float32,
+            c_dtype=dtype,
+            d_dtype=dtype,
+            cd_major="n",
+            act_func=self._cudnn_act_func,
+            linear_offset=self._cudnn_linear_offset,
             # Mandatory: without it the wrapper returns c_tensor=None and the
             # backward has no activation input.
-            "generate_c": requires_grad,
-            "use_dynamic_sched": True,
-            "current_stream": current_stream,
-        }
-        fc1_activation_kwargs.update(_bf16_fprop_weight_kwargs(fc1_op, num_groups, device))
-        fc1_kernel_out = self.grouped_gemm_activation_kernel()(**fc1_activation_kwargs)
+            generate_c=requires_grad,
+            use_dynamic_sched=True,
+            current_stream=current_stream,
+            **_bf16_fprop_weight_kwargs(fc1_op, num_groups, device),
+        )
 
-        # FC1 pre-activation, saved for the backward dGLU.
+        # FC1 pre-activation (M, 2F), saved for the backward dGLU.
         activation_in = None
         if requires_grad:
             activation_in = fc1_kernel_out["c_tensor"]
@@ -3852,40 +3910,33 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                     "The BF16 GLU kernel did not return the pre-activation tensor; "
                     "generate_c was not honoured."
                 )
-            activation_in = activation_in.view(total_tokens, fc1_weight_shape[0])
 
-        # FC2 GEMM. The GLU kernel's d_tensor already has cuDNN's (M, N, 1)
-        # layout, so it is passed straight through as FC2's A operand.
-        fc2_out_shape = in_shape[:-1] + [fc2_weight_shape[0]]
-        fc2_out_buf = validate_or_alloc_output(output_buffer, fc2_out_shape, dtype, device)
+        # FC2 GEMM: the GLU output (M, F) is FC2's A operand and the (M, H) output
+        # buffer is its D, both as-is.
         fc2_in = fc1_kernel_out["d_tensor"]
-        fc2_gemm_kwargs = {
-            "a_tensor": fc2_in,
-            "padded_offsets": split_points,
-            "alpha_tensor": alpha_tensor,
-            "bias_tensor": _pack_grouped_linear_bias_for_cudnn(fc2_op),
-            "prob_tensor": _bf16_ones_prob(total_tokens, device),
-            "acc_dtype": torch.float32,
-            "c_dtype": dtype,
-            "d_dtype": dtype,
-            "d_tensor": fc2_out_buf.as_strided(
-                (total_tokens, fc2_weight_shape[0], 1),
-                (fc2_weight_shape[0], 1, total_tokens * fc2_weight_shape[0]),
-            ),
-            "cd_major": "n",
-            "generate_c": False,
-            "use_dynamic_sched": True,
-            "current_stream": current_stream,
-        }
-        fc2_gemm_kwargs.update(_bf16_fprop_weight_kwargs(fc2_op, num_groups, device))
-        self.grouped_gemm_kernel()(**fc2_gemm_kwargs)
-        fc2_out = fc2_out_buf
+        fc2_out = validate_or_alloc_output(
+            output_buffer, in_shape[:-1] + [fc2_weight_shape[0]], dtype, device
+        )
+        self.grouped_gemm_kernel()(
+            a_tensor=fc2_in,
+            padded_offsets=split_points,
+            alpha_tensor=alpha_tensor,
+            bias_tensor=_pack_grouped_linear_bias_for_cudnn(fc2_op),
+            prob_tensor=_bf16_ones_prob(total_tokens, device),
+            acc_dtype=torch.float32,
+            c_dtype=dtype,
+            d_dtype=dtype,
+            d_tensor=fc2_out,
+            cd_major="n",
+            generate_c=False,
+            use_dynamic_sched=True,
+            current_stream=current_stream,
+            **_bf16_fprop_weight_kwargs(fc2_op, num_groups, device),
+        )
 
         if requires_grad:
             saved_fc1_x = fc1_x if weight_requires_grad else None
-            saved_fc2_x = (
-                fc2_in.view(total_tokens, fc2_weight_shape[1]) if weight_requires_grad else None
-            )
+            saved_fc2_x = fc2_in if weight_requires_grad else None
             if is_cpu_offload_enabled():
                 offload_tensors = [
                     t for t in (saved_fc1_x, activation_in, saved_fc2_x) if t is not None
@@ -3899,7 +3950,7 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                 base_split_offsets,
                 saved_fc1_x,
                 activation_in,
-                scales,
+                None if unit_activation_scale else prob_tensor,
                 saved_fc2_x,
             )
             fc1_ctx.dtype = dtype
@@ -3946,7 +3997,7 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
             base_split_offsets,
             saved_fc1_x,
             activation_in,
-            scales,
+            saved_prob,
             saved_fc2_x,
         ) = fc1_ctx.saved_tensors
 
@@ -3970,42 +4021,54 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
                 fc2_bias_grads = [fc2_dbias_packed[idx] for idx in range(num_groups)]
 
         # FC2 dgrad fused with the GLU backward, producing the FC1 grad output,
-        # the routing-probability grad, and optionally the FC1 bias grad.
+        # the routing-probability grad, and optionally the FC1 bias grad. All
+        # activation operands are canonical: A (M, H), C (M, 2F), prob/dprob (M,).
         unit_activation_scale = bool(getattr(fc1_ctx, "unit_activation_scale", False))
+        # A unit activation scale produces no dprob, so there is nothing to make deterministic.
+        if (
+            not unit_activation_scale
+            and _deterministic_algorithms_required()
+            and not self.grouped_gemm_dactivation_is_deterministic()
+        ):
+            raise RuntimeError(
+                "Deterministic execution was requested (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 or"
+                " torch.use_deterministic_algorithms), but the BF16 fused grouped MLP"
+                " accumulates the scale gradient (dprob) with nondeterministic atomics."
+                " Unset NVTE_CUTEDSL_FUSED_GROUPED_MLP to run the unfused ops."
+            )
         if unit_activation_scale:
             prob_tensor = _bf16_ones_prob(total_tokens, device)
         else:
-            prob_tensor = scales.detach().to(dtype=torch.float32).reshape(total_tokens, 1, 1)
+            prob_tensor = saved_prob
         # Required by the BF16 dGLU API even when the grad is discarded below.
-        dprob_tensor = torch.zeros((total_tokens, 1, 1), dtype=torch.float32, device=device)
+        dprob_tensor = torch.zeros(total_tokens, dtype=torch.float32, device=device)
 
-        fc2_dactivation_kwargs = {
-            "a_tensor": _bf16_as_cudnn_3d(fc2_dy, total_tokens, fc2_weight_shape[0]),
-            "c_tensor": _bf16_as_cudnn_3d(activation_in, total_tokens, fc1_weight_shape[0]),
-            "sfa_tensor": None,
-            "padded_offsets": split_points,
-            "alpha_tensor": alpha_tensor,
-            "beta_tensor": alpha_tensor,
-            "prob_tensor": prob_tensor,
-            "dprob_tensor": dprob_tensor,
-            "generate_dbias": fc1_op.has_bias,
-            "acc_dtype": torch.float32,
-            "d_dtype": dtype,
-            "cd_major": "n",
-            "act_func": self._cudnn_dact_func,
-            "linear_offset": self._cudnn_linear_offset,
-            "use_dynamic_sched": True,
-            "current_stream": current_stream,
-        }
-        fc2_dactivation_kwargs.update(_bf16_dglu_weight_kwargs(fc2_op, num_groups, device))
-        fc2_dgrad_kernel_out = self.grouped_gemm_dactivation_kernel()(**fc2_dactivation_kwargs)
+        fc2_dgrad_kernel_out = self.grouped_gemm_dactivation_kernel()(
+            a_tensor=fc2_dy,
+            c_tensor=activation_in,
+            sfa_tensor=None,
+            padded_offsets=split_points,
+            alpha_tensor=alpha_tensor,
+            beta_tensor=alpha_tensor,
+            prob_tensor=prob_tensor,
+            dprob_tensor=dprob_tensor,
+            generate_dbias=fc1_op.has_bias,
+            acc_dtype=torch.float32,
+            d_dtype=dtype,
+            cd_major="n",
+            act_func=self._cudnn_dact_func,
+            linear_offset=self._cudnn_linear_offset,
+            use_dynamic_sched=True,
+            current_stream=current_stream,
+            **_bf16_dgrad_weight_kwargs(fc2_op, num_groups, device),
+        )
 
-        fc1_dy = fc2_dgrad_kernel_out["d_row_tensor"].view(total_tokens, fc1_weight_shape[0])
+        fc1_dy = fc2_dgrad_kernel_out["d_row_tensor"]
         grad_scales = None
         if not unit_activation_scale:
             grad_scales = fc2_dgrad_kernel_out["dprob_tensor"]
             if grad_scales is not None:
-                grad_scales = grad_scales.view(-1).to(dtype=dtype)
+                grad_scales = grad_scales.to(dtype=dtype)
 
         fc1_bias_grads: Optional[list[Optional[torch.Tensor]]] = None
         fc1_bias_grad_packed: Optional[torch.Tensor] = None
@@ -4055,32 +4118,28 @@ class GroupedMLP_CuTeGEMMGLUBf16(FusedOperation):
             ),
         )
 
-        # FC1 dgrad.
+        # FC1 dgrad: (M, 2F) x per-expert (2F, H) weights read N-major in place,
+        # written straight into the (M, H) grad-input buffer.
         grad_input = None
         grad_input_buffer = getattr(fc1_ctx, "dgrad_out", None)
         if fc1_ctx.input_requires_grad:
             in_shape = out_shape[:-1] + [fc1_weight_shape[1]]
-            grad_input_buffer = validate_or_alloc_output(grad_input_buffer, in_shape, dtype, device)
-            fc1_dgrad_kwargs = {
-                "a_tensor": _bf16_as_cudnn_3d(fc1_dy, total_tokens, fc1_weight_shape[0]),
-                "padded_offsets": split_points,
-                "alpha_tensor": alpha_tensor,
-                "prob_tensor": _bf16_ones_prob(total_tokens, device),
-                "acc_dtype": torch.float32,
-                "c_dtype": dtype,
-                "d_dtype": dtype,
-                "d_tensor": grad_input_buffer.as_strided(
-                    (total_tokens, fc1_weight_shape[1], 1),
-                    (fc1_weight_shape[1], 1, total_tokens * fc1_weight_shape[1]),
-                ),
-                "cd_major": "n",
-                "generate_c": False,
-                "use_dynamic_sched": True,
-                "current_stream": current_stream,
-            }
-            fc1_dgrad_kwargs.update(_bf16_transposed_weight_kwargs(fc1_op, num_groups))
-            self.grouped_gemm_kernel()(**fc1_dgrad_kwargs)
-            grad_input = grad_input_buffer
+            grad_input = validate_or_alloc_output(grad_input_buffer, in_shape, dtype, device)
+            self.grouped_gemm_kernel()(
+                a_tensor=fc1_dy,
+                padded_offsets=split_points,
+                alpha_tensor=alpha_tensor,
+                prob_tensor=_bf16_ones_prob(total_tokens, device),
+                acc_dtype=torch.float32,
+                c_dtype=dtype,
+                d_dtype=dtype,
+                d_tensor=grad_input,
+                cd_major="n",
+                generate_c=False,
+                use_dynamic_sched=True,
+                current_stream=current_stream,
+                **_bf16_dgrad_weight_kwargs(fc1_op, num_groups, device),
+            )
 
         # FC1 wgrad.
         fc1_grad_params = _compute_grad_params(

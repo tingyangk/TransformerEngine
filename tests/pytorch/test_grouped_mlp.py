@@ -3177,8 +3177,28 @@ class TestGroupedMLPDeterminism:
         """The capability belongs to the wrapper, not the environment. Needs no GPU."""
         glu = grouped_mlp_module.GroupedMLP_CuTeGEMMGLU
         unary = grouped_mlp_module.GroupedMLP_CuTeGEMMUnary
+        bf16 = grouped_mlp_module.GroupedMLP_CuTeGEMMGLUBf16
         assert glu.grouped_gemm_dactivation_is_deterministic() is False
+        assert bf16.grouped_gemm_dactivation_is_deterministic() is False
         assert isinstance(unary.grouped_gemm_dactivation_is_deterministic(), bool)
+
+    def test_bf16_refuses_determinism(self, monkeypatch) -> None:
+        """The BF16 dGLU sums ``dprob`` with atomics, so a determinism request must fail loudly."""
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMGLUBf16
+        if not fused_cls.is_supported():
+            pytest.skip("BF16 fused grouped MLP is not supported on this system")
+        if torch.cuda.get_device_capability() >= (10, 7):
+            pytest.skip("BF16 fused grouped MLP declines on Rubin")
+
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        with pytest.raises(RuntimeError, match="dprob"):
+            TestGroupedMLPFusedOp().test_grouped_mlp(
+                bias=False,
+                hidden_size=128,
+                quantization=None,
+                single_grouped_weight=False,
+                activation="scaled_swiglu",
+            )
 
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
     @pytest.mark.parametrize(
@@ -3518,6 +3538,50 @@ class TestGroupedMLPBf16FusedOp:
         """
         assert list(fused) == list(ops), msg
         assert not any(isinstance(op, fused_cls) for op in fused), msg
+
+    @pytest.mark.parametrize(
+        "version_ok,has_flag,expected",
+        (
+            (True, True, True),
+            # cuDNN frontend older than the canonical-layout release.
+            (False, True, False),
+            # A develop build that reports 1.32.0 but predates the canonical layouts.
+            (True, False, False),
+        ),
+    )
+    def test_requires_canonical_layout_cudnn_frontend(
+        self, monkeypatch, *, version_ok: bool, has_flag: bool, expected: bool
+    ) -> None:
+        """Support needs both the minimum version and the wrappers' capability flag."""
+        fused_cls = grouped_mlp_module.GroupedMLP_CuTeGEMMGLUBf16
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        monkeypatch.setattr(grouped_mlp_module, "get_device_compute_capability", lambda: (10, 0))
+        monkeypatch.setattr(
+            grouped_mlp_module,
+            "_cudnn_frontend_version_at_least",
+            lambda v: (
+                version_ok if v == grouped_mlp_module._BF16_MIN_CUDNN_FRONTEND_VERSION else True
+            ),
+        )
+
+        def wrapper(*args, **kwargs):
+            raise AssertionError("support detection must not launch a kernel")
+
+        if has_flag:
+            wrapper.supports_bf16_canonical_layouts = True
+        for getter in (
+            "grouped_gemm_kernel",
+            "grouped_gemm_activation_kernel",
+            "grouped_gemm_dactivation_kernel",
+            "grouped_gemm_wgrad_kernel",
+        ):
+            monkeypatch.setattr(fused_cls, getter, classmethod(lambda cls: wrapper))
+        fused_cls.is_supported.cache_clear()
+        try:
+            assert fused_cls.is_supported() is expected
+        finally:
+            # The result was computed under stubs; drop it so later tests re-detect.
+            fused_cls.is_supported.cache_clear()
 
     def test_claims_unquantized_recipes_only(self, monkeypatch) -> None:
         """BF16 fuses when there is no block-scaled recipe, and only then.
